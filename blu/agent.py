@@ -1,349 +1,259 @@
-# Simple reliable team: one seeker (index 0) uses global A* to fetch enemy flag and return,
-# two supporters (index != 0) shoot and chase enemies. No reservation system.
-#
-# Usage: copy to your team folder and run:
-#   python main.py my_team other_team --headless --ascii
-#
 from collections import deque
 import heapq
-import random
 from config import *
 
-DIR_DELTAS = {
-    "left": (-1, 0),
+WALL = ASCII_TILES["wall"]
+UNK  = ASCII_TILES["unknown"]
+EMP  = ASCII_TILES["empty"]
+
+DIRS = {
     "right": (1, 0),
+    "left": (-1, 0),
+    "down": (0, 1),
     "up": (0, -1),
-    "down": (0, 1)
 }
 
-def manhattan(a, b):
-    return abs(a[0]-b[0]) + abs(a[1]-b[1])
-
 class Agent:
+
     def __init__(self, color, index):
         self.color = color
         self.index = index
-        self._rnd = random.Random(1000 + index)
 
-        if color == "blue":
-            self.enemy_agent_char = "r"
-            self.enemy_flag_char = ASCII_TILES["red_flag"]
-            self.friendly_flag_char = ASCII_TILES["blue_flag"]
-            self.attack_direction = "right"
-            self.home_direction = "left"
-        else:
-            self.enemy_agent_char = "b"
-            self.enemy_flag_char = ASCII_TILES["blue_flag"]
-            self.friendly_flag_char = ASCII_TILES["red_flag"]
-            self.attack_direction = "left"
-            self.home_direction = "right"
+        self.enemy_flag_tile = ASCII_TILES["red_flag"] if color == "blue" else ASCII_TILES["blue_flag"]
+        self.home_flag_tile  = ASCII_TILES["blue_flag"] if color == "blue" else ASCII_TILES["red_flag"]
 
-    # ---------------- Map utilities ----------------
-    def _ensure_map(self, shared_knowledge):
-        if "map" not in shared_knowledge:
-            shared_knowledge["map"] = {}
+        # blue ide desno, red ide lijevo :contentReference[oaicite:1]{index=1}
+        self.enemy_bias_dx = 1 if color == "blue" else -1
 
-    def _update_map_from_visible(self, visible_world, position, shared_knowledge):
-        """Write observed visible_world tiles into shared_knowledge['map'] using absolute coords."""
-        self._ensure_map(shared_knowledge)
-        gm = shared_knowledge["map"]
-        size = AGENT_VISION_RANGE * 2 + 1
-        center = AGENT_VISION_RANGE
-        for vy in range(size):
-            for vx in range(size):
-                ch = visible_world[vy][vx]
-                abs_x = position[0] + (vx - center)
-                abs_y = position[1] + (vy - center)
-                gm[(abs_x, abs_y)] = ch
-                if ch == self.enemy_flag_char:
-                    shared_knowledge["enemy_flag"] = (abs_x, abs_y)
-                if ch == self.friendly_flag_char:
-                    shared_knowledge["friendly_flag"] = (abs_x, abs_y)
+        # movement feedback
+        self.prev_pos = None
+        self.pending_target = None
 
-    # ---------------- A* on observed map ----------------
-    def _astar(self, start, goal, shared_knowledge, max_nodes=20000):
-        """A* using known map; unknown tiles treated as traversable."""
-        if start == goal:
-            return [start]
-        self._ensure_map(shared_knowledge)
-        gm = shared_knowledge["map"]
-        open_heap = []
-        heapq.heappush(open_heap, (manhattan(start, goal), 0, start))
-        came_from = {start: None}
-        gscore = {start: 0}
-        visited = 0
-        while open_heap:
-            _, g, current = heapq.heappop(open_heap)
-            visited += 1
-            if visited > max_nodes:
-                break
-            if current == goal:
-                # reconstruct
-                path = []
-                cur = current
-                while cur is not None:
-                    path.append(cur)
-                    cur = came_from[cur]
-                path.reverse()
-                return path
-            cx, cy = current
-            for dx, dy in DIR_DELTAS.values():
-                nb = (cx + dx, cy + dy)
-                # skip known wall
-                if gm.get(nb) == ASCII_TILES["wall"]:
+        # anti-loop
+        self.recent = deque(maxlen=6)
+        self.stuck_count = 0
+
+    # ---------- Shared knowledge ----------
+    def _sk_init(self, sk):
+        sk.setdefault("map", {})              # (x,y)->tile
+        sk.setdefault("enemy_flag_pos", None)
+        sk.setdefault("home_flag_pos", None)
+
+    def _update_shared_map(self, visible_world, position, sk):
+        cx, cy = position
+        r = AGENT_VISION_RANGE
+        m = sk["map"]
+
+        for dy in range(-r, r + 1):
+            row = visible_world[dy + r]
+            for dx in range(-r, r + 1):
+                tile = row[dx + r]
+                if tile == UNK:
                     continue
-                tentative_g = g + 1
-                if nb not in gscore or tentative_g < gscore[nb]:
-                    gscore[nb] = tentative_g
-                    f = tentative_g + manhattan(nb, goal)
-                    heapq.heappush(open_heap, (f, tentative_g, nb))
-                    came_from[nb] = current
-        return []
+                wx, wy = cx + dx, cy + dy
 
-    def _coords_to_dir(self, cur, nxt):
-        dx = nxt[0] - cur[0]
-        dy = nxt[1] - cur[1]
-        for d, (ddx, ddy) in DIR_DELTAS.items():
-            if (ddx, ddy) == (dx, dy):
-                return d
+                # treat dynamic entities as empty (navigation)
+                if tile in (
+                    ASCII_TILES["blue_agent"], ASCII_TILES["red_agent"],
+                    ASCII_TILES["blue_agent_f"], ASCII_TILES["red_agent_f"],
+                    ASCII_TILES["bullet"]
+                ):
+                    tile = EMP
+
+                m[(wx, wy)] = tile
+
+                if tile == self.enemy_flag_tile:
+                    sk["enemy_flag_pos"] = (wx, wy)
+                elif tile == self.home_flag_tile:
+                    sk["home_flag_pos"] = (wx, wy)
+
+    # ---------- Learning from bumps ----------
+    def _apply_bump_learning(self, position, sk):
+        if self.prev_pos is None:
+            return
+        if position == self.prev_pos and self.pending_target is not None:
+            sk["map"][self.pending_target] = WALL
+            self.stuck_count += 1
+        else:
+            self.stuck_count = 0
+
+        self.pending_target = None
+
+    # ---------- Pathfinding (Dijkstra with unknown penalty) ----------
+    def _tile_cost(self, sk_map, x, y):
+        # out of bounds are walls :contentReference[oaicite:2]{index=2}
+        if x <= 0 or y <= 0 or x >= WIDTH - 1 or y >= HEIGHT - 1:
+            return None  # impassable
+
+        t = sk_map.get((x, y), None)
+        if t == WALL:
+            return None
+        if t is None:
+            return 4  # UNKNOWN penalty (optimistic but cautious)
+        return 1      # known empty/flags
+
+    def _dijkstra_next_step(self, start, goal, sk_map):
+        if goal is None or goal == start:
+            return None
+
+        pq = [(0, start)]
+        dist = {start: 0}
+        prev = {start: None}
+
+        while pq:
+            d, (x, y) = heapq.heappop(pq)
+            if (x, y) == goal:
+                break
+            if d != dist.get((x, y), 10**9):
+                continue
+
+            for dx, dy in DIRS.values():
+                nx, ny = x + dx, y + dy
+                c = self._tile_cost(sk_map, nx, ny)
+                if c is None:
+                    continue
+                nd = d + c
+                if nd < dist.get((nx, ny), 10**9):
+                    dist[(nx, ny)] = nd
+                    prev[(nx, ny)] = (x, y)
+                    heapq.heappush(pq, (nd, (nx, ny)))
+
+        if goal not in prev:
+            return None
+
+        # reconstruct: find first step after start
+        cur = goal
+        while prev[cur] != start:
+            cur = prev[cur]
+            if cur is None:
+                return None
+        return cur
+
+    # ---------- Exploration target ----------
+    def _pick_explore_goal(self, position, sk):
+        sk_map = sk["map"]
+        px, py = position
+
+        def is_frontier(x, y):
+            if sk_map.get((x, y), None) in (None, WALL):
+                return False
+            for dx, dy in DIRS.values():
+                if sk_map.get((x + dx, y + dy), None) is None:
+                    return True
+            return False
+
+        best = None
+        best_score = None
+
+        # 1) frontiers from known map
+        for (x, y), t in sk_map.items():
+            if t == WALL:
+                continue
+            if not is_frontier(x, y):
+                continue
+            dist = abs(x - px) + abs(y - py)
+            forward = (x - px) * self.enemy_bias_dx  # prefer forward
+            score = dist - 0.7 * forward
+
+            if (x, y) in self.recent:
+                score += 2.5
+
+            if best_score is None or score < best_score:
+                best_score = score
+                best = (x, y)
+
+        if best is not None:
+            return best
+
+        # 2) if no frontier known yet: push forward deterministically
+        # aim a point forward + small vertical variation by agent index to spread
+        target_x = px + 6 * self.enemy_bias_dx
+        target_y = py + ((self.index % 3) - 1) * 2
+        target_x = max(1, min(WIDTH - 2, target_x))
+        target_y = max(1, min(HEIGHT - 2, target_y))
+        return (target_x, target_y)
+
+    # ---------- Move decision ----------
+    def _step_to_dir(self, position, nxt):
+        x, y = position
+        nx, ny = nxt
+        if nx > x: return "right"
+        if nx < x: return "left"
+        if ny > y: return "down"
+        if ny < y: return "up"
         return None
 
-    # Bresenham-like check for clear line in visible window (used for shooting)
-    def _visible_has_clear_line(self, visible_world, sx, sy, tx, ty):
-        x1, y1, x2, y2 = sx, sy, tx, ty
-        dx = abs(x2 - x1); dy = abs(y2 - y1)
-        sx_step = 1 if x1 < x2 else -1
-        sy_step = 1 if y1 < y2 else -1
-        err = dx - dy
-        txc, tyc = x1, y1
-        while True:
-            if visible_world[tyc][txc] == ASCII_TILES["wall"]:
-                return False
-            if txc == x2 and tyc == y2:
-                return True
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                txc += sx_step
-            if e2 < dx:
-                err += dx
-                tyc += sy_step
+    def _set_pending(self, position, direction):
+        dx, dy = DIRS[direction]
+        self.pending_target = (position[0] + dx, position[1] + dy)
 
-    # ---------------- Supporter behavior ----------------
-    def _supporter(self, visible_world, position, can_shoot, holding_flag, shared_knowledge, hp, ammo):
-        size = AGENT_VISION_RANGE * 2 + 1
-        center = AGENT_VISION_RANGE
+    def _escape_move(self, position, sk):
+        sk_map = sk["map"]
+        px, py = position
 
-        # publish pos so teammates can use it if needed
-        shared_knowledge[f"agent_{self.index}_pos"] = position
+        # deterministic order biased forward, then vertical, then back
+        ordered = []
+        forward_dir = "right" if self.enemy_bias_dx == 1 else "left"
+        back_dir = "left" if forward_dir == "right" else "right"
+        ordered.append(forward_dir)
+        ordered += ["up", "down", back_dir]
 
-        # 1) shooting priority: aligned & clear LOS
-        enemies = []
-        for y in range(size):
-            for x in range(size):
-                ch = visible_world[y][x]
-                if ch.lower() == self.enemy_agent_char:
-                    enemies.append((x, y))
-        if can_shoot and ammo > 0 and enemies:
-            sx, sy = center, center
-            for (ex, ey) in enemies:
-                if ex == sx or ey == sy:
-                    if self._visible_has_clear_line(visible_world, sx, sy, ex, ey):
-                        if ex == sx:
-                            return "shoot", "up" if ey < sy else "down"
-                        else:
-                            return "shoot", "left" if ex < sx else "right"
+        for d in ordered:
+            dx, dy = DIRS[d]
+            nx, ny = px + dx, py + dy
+            if self._tile_cost(sk_map, nx, ny) is None:
+                continue
+            if (nx, ny) in self.recent:
+                continue
+            return d
 
-        # 2) chase nearest visible enemy using A* on known map (robust)
-        if enemies:
-            target = min(enemies, key=lambda e: abs(e[0]-center) + abs(e[1]-center))
-            tgt_abs = (position[0] + (target[0]-center), position[1] + (target[1]-center))
-            path = self._astar(position, tgt_abs, shared_knowledge, max_nodes=2000)
-            if path and len(path) >= 2:
-                d = self._coords_to_dir(position, path[1])
-                return "move", d
-            # fallback greedy toward target
-            dx = tgt_abs[0] - position[0]
-            dy = tgt_abs[1] - position[1]
-            prefer = []
-            if abs(dx) >= abs(dy):
-                prefer.append("right" if dx > 0 else "left")
-                if dy != 0:
-                    prefer.append("down" if dy > 0 else "up")
-            else:
-                prefer.append("down" if dy > 0 else "up")
-                if dx != 0:
-                    prefer.append("right" if dx > 0 else "left")
-            # avoid immediate wall
-            for d in prefer:
-                ddx, ddy = DIR_DELTAS[d]
-                tx, ty = center + ddx, center + ddy
-                if 0 <= tx < size and 0 <= ty < size and visible_world[ty][tx] != ASCII_TILES["wall"]:
-                    return "move", d
+        # if everything repeats, just take any passable
+        for d in ordered:
+            dx, dy = DIRS[d]
+            nx, ny = px + dx, py + dy
+            if self._tile_cost(sk_map, nx, ny) is not None:
+                return d
 
-        # 3) go to remembered enemy_flag (help seeker) if known
-        if "enemy_flag" in shared_knowledge and shared_knowledge["enemy_flag"]:
-            tgt = shared_knowledge["enemy_flag"]
-            path = self._astar(position, tgt, shared_knowledge, max_nodes=3000)
-            if path and len(path) >= 2:
-                return "move", self._coords_to_dir(position, path[1])
+        return None
 
-        # 4) default exploration toward attack side
-        size_vis = AGENT_VISION_RANGE*2+1
-        center = AGENT_VISION_RANGE
-        prefer = [self.attack_direction, "up", "down", "left" if self.attack_direction == "right" else "right"]
-        for d in prefer:
-            ddx, ddy = DIR_DELTAS[d]
-            tx, ty = center + ddx, center + ddy
-            if 0 <= tx < size_vis and 0 <= ty < size_vis and visible_world[ty][tx] != ASCII_TILES["wall"]:
-                return "move", d
-
-        return "", None
-
-    # ---------------- Seeker behavior ----------------
-    def _seeker(self, visible_world, position, can_shoot, holding_flag, shared_knowledge, hp, ammo):
-        """Seeker plans A* to enemy_flag (absolute) and, after pickup, A* to friendly_flag."""
-        # publish pos
-        shared_knowledge[f"agent_{self.index}_pos"] = position
-
-        # compute goals
-        goal = None
-        goal_type = None
-        if holding_flag:
-            # return to friendly flag spawn (if known)
-            if "friendly_flag" in shared_knowledge:
-                goal = shared_knowledge["friendly_flag"]
-                goal_type = "friendly"
-        else:
-            if "enemy_flag" in shared_knowledge:
-                goal = shared_knowledge["enemy_flag"]
-                goal_type = "enemy"
-
-        # If we have a goal, compute A* from current position to it each tick (robust to dynamic changes)
-        if goal:
-            path = self._astar(position, goal, shared_knowledge, max_nodes=20000)
-            if path and len(path) >= 2:
-                next_coord = path[1]
-                d = self._coords_to_dir(position, next_coord)
-                # move toward next step
-                return "move", d
-            else:
-                # A* failed (maybe unknown obstacles). Fallback: greedy move toward goal that avoids immediate walls.
-                dx = goal[0] - position[0]
-                dy = goal[1] - position[1]
-                prefer = []
-                if abs(dx) >= abs(dy):
-                    prefer.append("right" if dx > 0 else "left")
-                    if dy != 0:
-                        prefer.append("down" if dy > 0 else "up")
-                else:
-                    prefer.append("down" if dy > 0 else "up")
-                    if dx != 0:
-                        prefer.append("right" if dx > 0 else "left")
-                size_vis = AGENT_VISION_RANGE*2+1
-                center = AGENT_VISION_RANGE
-                for d in prefer:
-                    ddx, ddy = DIR_DELTAS[d]
-                    tx, ty = center + ddx, center + ddy
-                    if 0 <= tx < size_vis and 0 <= ty < size_vis and visible_world[ty][tx] != ASCII_TILES["wall"]:
-                        return "move", d
-                # if blocked locally, try any free neighbor
-                for d, (ddx, ddy) in DIR_DELTAS.items():
-                    tx, ty = center + ddx, center + ddy
-                    if 0 <= tx < size_vis and 0 <= ty < size_vis and visible_world[ty][tx] != ASCII_TILES["wall"]:
-                        return "move", d
-                return "", None
-
-        # If no goal (haven't seen enemy flag yet), behave opportunistically: shoot/chase visible enemies or explore
-        # shooting priority:
-        size = AGENT_VISION_RANGE*2+1
-        center = AGENT_VISION_RANGE
-        enemies = []
-        for y in range(size):
-            for x in range(size):
-                ch = visible_world[y][x]
-                if ch.lower() == self.enemy_agent_char:
-                    enemies.append((x, y))
-        if can_shoot and ammo > 0 and enemies:
-            sx, sy = center, center
-            for (ex, ey) in enemies:
-                if ex == sx or ey == sy:
-                    if self._visible_has_clear_line(visible_world, sx, sy, ex, ey):
-                        if ex == sx:
-                            return "shoot", "up" if ey < sy else "down"
-                        else:
-                            return "shoot", "left" if ex < sx else "right"
-        # chase nearest visible enemy (A* or greedy)
-        if enemies:
-            target = min(enemies, key=lambda e: abs(e[0]-center) + abs(e[1]-center))
-            tgt_abs = (position[0] + (target[0]-center), position[1] + (target[1]-center))
-            path = self._astar(position, tgt_abs, shared_knowledge, max_nodes=3000)
-            if path and len(path) >= 2:
-                return "move", self._coords_to_dir(position, path[1])
-            # greedy fallback
-            dx = tgt_abs[0] - position[0]
-            dy = tgt_abs[1] - position[1]
-            prefer = []
-            if abs(dx) >= abs(dy):
-                prefer.append("right" if dx > 0 else "left")
-                if dy != 0:
-                    prefer.append("down" if dy > 0 else "up")
-            else:
-                prefer.append("down" if dy > 0 else "up")
-                if dx != 0:
-                    prefer.append("right" if dx > 0 else "left")
-            size_vis = AGENT_VISION_RANGE*2+1
-            center = AGENT_VISION_RANGE
-            for d in prefer:
-                ddx, ddy = DIR_DELTAS[d]
-                tx, ty = center + ddx, center + ddy
-                if 0 <= tx < size_vis and 0 <= ty < size_vis and visible_world[ty][tx] != ASCII_TILES["wall"]:
-                    return "move", d
-
-        # exploratory movement: move toward attack side (avoid immediate wall)
-        size_vis = AGENT_VISION_RANGE*2+1
-        center = AGENT_VISION_RANGE
-        prefer = [self.attack_direction, "up", "down", "left" if self.attack_direction == "right" else "right"]
-        for d in prefer:
-            ddx, ddy = DIR_DELTAS[d]
-            tx, ty = center + ddx, center + ddy
-            if 0 <= tx < size_vis and 0 <= ty < size_vis and visible_world[ty][tx] != ASCII_TILES["wall"]:
-                return "move", d
-        return "", None
-
-    # ---------------- Main API ----------------
     def update(self, visible_world, position, can_shoot, holding_flag, shared_knowledge, hp, ammo):
-        """
-        visible_world: 2D list; agent centered at (AGENT_VISION_RANGE, AGENT_VISION_RANGE)
-        position: absolute (x,y)
-        holding_flag: truthy if agent holds enemy flag (AgentEngine passes Flag object or None)
-        shared_knowledge: dict persisted across team agents for this match
-        """
-        # update global map and any seen flag positions
-        self._update_map_from_visible(visible_world, position, shared_knowledge)
+        self._sk_init(shared_knowledge)
 
-        # basic survival: if very low hp or out of ammo, retreat to friendly flag if known
-        if hp <= 1 or ammo == 0:
-            if "friendly_flag" in shared_knowledge and shared_knowledge["friendly_flag"]:
-                refuge = shared_knowledge["friendly_flag"]
-                path = self._astar(position, refuge, shared_knowledge, max_nodes=5000)
-                if path and len(path) >= 2:
-                    return "move", self._coords_to_dir(position, path[1])
-            # fallback local retreat
-            size_vis = AGENT_VISION_RANGE*2+1
-            center = AGENT_VISION_RANGE
-            for d in [self.home_direction, "up", "down", "left", "right"]:
-                ddx, ddy = DIR_DELTAS[d]
-                tx, ty = center + ddx, center + ddy
-                if 0 <= tx < size_vis and 0 <= ty < size_vis and visible_world[ty][tx] != ASCII_TILES["wall"]:
-                    return "move", d
-            return "", None
+        # bump learning uses last tick outcome
+        self._apply_bump_learning(position, shared_knowledge)
 
-        # dispatch role
-        if self.index == 0:
-            return self._seeker(visible_world, position, can_shoot, holding_flag, shared_knowledge, hp, ammo)
+        # update map with new vision
+        self._update_shared_map(visible_world, position, shared_knowledge)
+
+        sk_map = shared_knowledge["map"]
+        enemy_flag_pos = shared_knowledge["enemy_flag_pos"]
+        home_flag_pos  = shared_knowledge["home_flag_pos"]
+
+        self.recent.append(position)
+        self.prev_pos = position
+
+        # Choose goal
+        if holding_flag:
+            goal = home_flag_pos
         else:
-            return self._supporter(visible_world, position, can_shoot, holding_flag, shared_knowledge, hp, ammo)
+            goal = enemy_flag_pos if enemy_flag_pos is not None else self._pick_explore_goal(position, shared_knowledge)
+
+        nxt = self._dijkstra_next_step(position, goal, sk_map)
+
+        # If pathfinding fails or we are stuck, escape
+        if nxt is None or self.stuck_count >= 2:
+            d = self._escape_move(position, shared_knowledge)
+            if d is None:
+                return "", ""
+            self._set_pending(position, d)
+            return "move", d
+
+        d = self._step_to_dir(position, nxt)
+        if d is None:
+            return "", ""
+
+        self._set_pending(position, d)
+        return "move", d
 
     def terminate(self, reason):
-        return
+        pass
